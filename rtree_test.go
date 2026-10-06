@@ -949,3 +949,97 @@ func TestNearby(t *testing.T) {
 	})
 
 }
+
+// TestMove covers moving an RTree entry by its stable identity (data).
+// The fixture uses two entries that share the exact same box but have
+// different identities: moving one must not disturb the other.
+func TestMove(t *testing.T) {
+	// collect returns the identities of all items found in the search box.
+	collect := func(tr *RTreeG[int], min, max [2]float64) []int {
+		var out []int
+		tr.Search(min, max, func(_, _ [2]float64, data int) bool {
+			out = append(out, data)
+			return true
+		})
+		return out
+	}
+
+	sameMin := [2]float64{10, 10}
+	sameMax := [2]float64{20, 20}
+	newMin := [2]float64{100, 100}
+	newMax := [2]float64{120, 120}
+
+	t.Run("SameBoxDifferentIDs", func(t *testing.T) {
+		var tr RTreeG[int]
+		tr.Insert(sameMin, sameMax, 1)
+		tr.Insert(sameMin, sameMax, 2)
+		if tr.Len() != 2 {
+			t.Fatalf("expected 2 items, got %d", tr.Len())
+		}
+		// Move only the item with stable identity 1 to the new box.
+		if !tr.Move(sameMin, sameMax, 1, newMin, newMax) {
+			t.Fatal("move of an existing item failed")
+		}
+		if tr.Len() != 2 {
+			t.Fatalf("expected 2 items after move, got %d", tr.Len())
+		}
+		// The old range must keep the other identity and lose the target.
+		if got := collect(&tr, sameMin, sameMax); len(got) != 1 || got[0] != 2 {
+			t.Fatalf("old range should contain only id 2, got %v", got)
+		}
+		// The new range must contain the moved target.
+		if got := collect(&tr, newMin, newMax); len(got) != 1 || got[0] != 1 {
+			t.Fatalf("new range should contain only id 1, got %v", got)
+		}
+	})
+
+	t.Run("InvalidBoxRejected", func(t *testing.T) {
+		var tr RTreeG[int]
+		tr.Insert(sameMin, sameMax, 1)
+		tr.Insert(sameMin, sameMax, 2)
+		// Reversed box on the first axis: invalid and must be rejected
+		// before anything is removed.
+		if tr.Move(sameMin, sameMax, 1,
+			[2]float64{200, 200}, [2]float64{100, 100}) {
+			t.Fatal("move to an invalid box should be rejected")
+		}
+		// Reversed box on the second axis as well.
+		if tr.Move(sameMin, sameMax, 1,
+			[2]float64{100, 200}, [2]float64{120, 100}) {
+			t.Fatal("move to an invalid box should be rejected")
+		}
+		// The old items must still be queryable and nothing was removed.
+		if tr.Len() != 2 {
+			t.Fatalf("expected 2 items after rejected move, got %d", tr.Len())
+		}
+		if got := collect(&tr, sameMin, sameMax); len(got) != 2 {
+			t.Fatalf("old items should be preserved, got %v", got)
+		}
+		if got := collect(&tr, newMin, newMax); len(got) != 0 {
+			t.Fatalf("new range should be empty, got %v", got)
+		}
+	})
+
+	t.Run("MissingItemUnchanged", func(t *testing.T) {
+		var tr RTreeG[int]
+		tr.Insert(sameMin, sameMax, 1)
+		tr.Insert(sameMin, sameMax, 2)
+		// Wrong identity for the shared box: nothing is deleted.
+		if tr.Move(sameMin, sameMax, 99, newMin, newMax) {
+			t.Fatal("move of a missing identity should fail")
+		}
+		// Wrong old box for an existing identity: nothing is deleted.
+		if tr.Move([2]float64{0, 0}, [2]float64{1, 1}, 1, newMin, newMax) {
+			t.Fatal("move from an empty old box should fail")
+		}
+		if tr.Len() != 2 {
+			t.Fatalf("expected 2 items, got %d", tr.Len())
+		}
+		if got := collect(&tr, sameMin, sameMax); len(got) != 2 {
+			t.Fatalf("old items should be preserved, got %v", got)
+		}
+		if got := collect(&tr, newMin, newMax); len(got) != 0 {
+			t.Fatalf("new range should be empty, got %v", got)
+		}
+	})
+}

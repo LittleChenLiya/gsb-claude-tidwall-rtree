@@ -715,6 +715,35 @@ func (tr *RTreeGN[N, T]) Replace(
 	}
 }
 
+// validBox reports whether the rectangle is well formed: both axes must have
+// min <= max. Reversed or NaN boxes are rejected.
+func validBox[N numeric](min, max [2]N) bool {
+	return min[0] <= max[0] && min[1] <= max[1]
+}
+
+// Move relocates an item from its old rectangle to a new rectangle while
+// keeping the same data, which serves as the item's stable identity. Only an
+// item whose rectangle and data both match is removed, so other items sharing
+// the old box with a different identity are left untouched.
+//
+// The new rectangle is validated before anything is removed, and deleting the
+// old item and inserting the new one behaves as a single operation: if the
+// new box is invalid or the old item cannot be found, the tree is left
+// unchanged and the old item is still queryable. The ordinary Insert and
+// Delete operations are unaffected. Returns true when the item was moved.
+func (tr *RTreeGN[N, T]) Move(oldMin, oldMax [2]N, data T,
+	newMin, newMax [2]N,
+) bool {
+	if !validBox(newMin, newMax) {
+		return false
+	}
+	if !tr.delete(oldMin, oldMax, data, nil) {
+		return false
+	}
+	tr.Insert(newMin, newMax, data)
+	return true
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeGN[N, T]) Bounds() (min, max [2]N) {
 	return tr.rect.min, tr.rect.max
@@ -988,6 +1017,16 @@ func (tr *RTreeG[T]) Replace(
 	)
 }
 
+// Move relocates the item with the given stable identity from its old
+// rectangle to a new rectangle. The new box is validated before any mutation
+// and the delete-and-insert behaves as a single operation; on failure the old
+// item is still queryable. Returns true when the item was moved.
+func (tr *RTreeG[T]) Move(oldMin, oldMax [2]float64, data T,
+	newMin, newMax [2]float64,
+) bool {
+	return tr.base.Move(oldMin, oldMax, data, newMin, newMax)
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeG[T]) Bounds() (min, max [2]float64) {
 	return tr.base.Bounds()
@@ -1094,6 +1133,16 @@ func (tr *RTree) Replace(
 		oldMin, oldMax, oldData,
 		newMin, newMax, newData,
 	)
+}
+
+// Move relocates the item with the given stable identity from its old
+// rectangle to a new rectangle. The new box is validated before any mutation
+// and the delete-and-insert behaves as a single operation; on failure the old
+// item is still queryable. Returns true when the item was moved.
+func (tr *RTree) Move(oldMin, oldMax [2]float64, data any,
+	newMin, newMax [2]float64,
+) bool {
+	return tr.base.Move(oldMin, oldMax, data, newMin, newMax)
 }
 
 // Search the structure for items that intersects the rect param
