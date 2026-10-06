@@ -5,6 +5,9 @@
 package rtree
 
 import (
+	"errors"
+	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -46,11 +49,12 @@ type numeric interface {
 }
 
 type RTreeGN[N numeric, T any] struct {
-	icow  uint64
-	count int
-	rect  rect[N]
-	root  *node[N, T]
-	qpool *sync.Pool
+	icow   uint64
+	count  int
+	rect   rect[N]
+	root   *node[N, T]
+	qpool  *sync.Pool
+	nextID uint64
 }
 
 type rect[N numeric] struct {
@@ -94,6 +98,7 @@ func (n *node[N, T]) leaf() bool {
 
 type leafNode[N numeric, T any] struct {
 	node[N, T]
+	ids   [maxEntries]uint64
 	items [maxEntries]T
 }
 
@@ -116,6 +121,17 @@ func (n *node[N, T]) items() []T {
 		return nil
 	}
 	return (*leafNode[N, T])(unsafe.Pointer(n)).items[:]
+}
+
+// ids returns the stable insertion identifiers for leaf items. Each item
+// receives a unique, monotonically increasing id at insert time which is
+// used by KNN to deterministically break distance ties.
+func (n *node[N, T]) ids() []uint64 {
+	if n.kind != leaf {
+		// not a leaf
+		return nil
+	}
+	return (*leafNode[N, T])(unsafe.Pointer(n)).ids[:]
 }
 
 func (tr *RTreeGN[N, T]) newNode(isleaf bool) *node[N, T] {
@@ -204,6 +220,7 @@ func (tr *RTreeGN[N, T]) copy(n *node[N, T]) *node[N, T] {
 	n2 := tr.newNode(n.leaf())
 	*n2 = *n
 	if n2.leaf() {
+		copy(n2.ids()[:n.count], n.ids()[:n.count])
 		copy(n2.items()[:n.count], n.items()[:n.count])
 	} else {
 		copy(n2.children()[:n.count], n.children()[:n.count])
@@ -239,6 +256,8 @@ func (tr *RTreeGN[N, T]) nodeInsert(nr *rect[N], n *node[N, T], ir *rect[N],
 		items := n.items()
 		index := int(n.count)
 		n.rects[index] = *ir
+		n.ids()[index] = tr.nextID
+		tr.nextID++
 		items[index] = data
 		n.count++
 		grown = !nr.contains(ir)
@@ -401,6 +420,9 @@ func (tr *RTreeGN[N, T]) moveRectAtIndexInto(from *node[N, T], index int,
 	into.rects[into.count] = from.rects[index]
 	from.rects[index] = from.rects[from.count-1]
 	if from.leaf() {
+		into.ids()[into.count] = from.ids()[index]
+		from.ids()[index] = from.ids()[from.count-1]
+		from.ids()[from.count-1] = 0
 		into.items()[into.count] = from.items()[index]
 		from.items()[index] = from.items()[from.count-1]
 		from.items()[from.count-1] = empty
@@ -496,6 +518,7 @@ func (tr *RTreeGN[N, T]) Copy() *RTreeGN[N, T] {
 func (n *node[N, T]) swap(i, j int) {
 	n.rects[i], n.rects[j] = n.rects[j], n.rects[i]
 	if n.leaf() {
+		n.ids()[i], n.ids()[j] = n.ids()[j], n.ids()[i]
 		n.items()[i], n.items()[j] = n.items()[j], n.items()[i]
 	} else {
 		n.children()[i], n.children()[j] = n.children()[j], n.children()[i]
@@ -630,6 +653,8 @@ func (tr *RTreeGN[N, T]) nodeDelete(nr *rect[N], n *node[N, T], ir *rect[N],
 			}
 			// found the target item to delete
 			n.rects[i] = n.rects[n.count-1]
+			n.ids()[i] = n.ids()[n.count-1]
+			n.ids()[len(rects)-1] = 0
 			items[i] = items[n.count-1]
 			items[len(rects)-1] = empty
 			n.count--
@@ -892,6 +917,224 @@ func (q *queue[N, T]) pop() (qnode[N, T], bool) {
 	return n, true
 }
 
+// ErrInvalidQueryPoint is returned by KNN when the query point contains a
+// NaN or infinite coordinate, which would only produce invalid distances.
+var ErrInvalidQueryPoint = errors.New("rtree: invalid knn query point")
+
+// KNNItem is a single result of a KNN query. Dist is the true Euclidean
+// distance from the query point to the item (not a box-distance lower
+// bound), and ID is the item's stable insertion identifier which is used
+// to deterministically order items with equal distances.
+type KNNItem[T any] struct {
+	Min  [2]float64
+	Max  [2]float64
+	Data T
+	Dist float64
+	ID   uint64
+}
+
+// pointRectDist2 returns the squared Euclidean distance from the point
+// (px, py) to the closest point on r. This is a lower bound for the
+// distance to any item contained in r. It returns NaN when the rect
+// contains a NaN coordinate.
+func pointRectDist2[N numeric](px, py float64, r *rect[N]) float64 {
+	x0, y0 := float64(r.min[0]), float64(r.min[1])
+	x1, y1 := float64(r.max[0]), float64(r.max[1])
+	if math.IsNaN(x0) || math.IsNaN(y0) || math.IsNaN(x1) || math.IsNaN(y1) {
+		return math.NaN()
+	}
+	var d float64
+	if v := x0 - px; v > 0 {
+		d += v * v
+	} else if v := px - x1; v > 0 {
+		d += v * v
+	}
+	if v := y0 - py; v > 0 {
+		d += v * v
+	} else if v := py - y1; v > 0 {
+		d += v * v
+	}
+	return d
+}
+
+// knnEntry is a best-first queue entry. For nodes, key is the squared
+// Euclidean lower bound from the query point to the node rect. For items,
+// key is the squared true distance to the item.
+type knnEntry[N numeric, T any] struct {
+	key  float64
+	seq  uint64
+	id   uint64
+	rect rect[N]
+	data T
+	node *node[N, T] // nil for items
+}
+
+type knnHeap[N numeric, T any] []knnEntry[N, T]
+
+func knnLess[N numeric, T any](a, b *knnEntry[N, T]) bool {
+	if a.key != b.key {
+		return a.key < b.key
+	}
+	return a.seq < b.seq
+}
+
+func (h *knnHeap[N, T]) push(e knnEntry[N, T]) {
+	*h = append(*h, e)
+	nodes := *h
+	i := len(nodes) - 1
+	parent := (i - 1) / 2
+	for ; i != 0 && knnLess(&nodes[i], &nodes[parent]); parent = (i - 1) / 2 {
+		nodes[parent], nodes[i] = nodes[i], nodes[parent]
+		i = parent
+	}
+}
+
+func (h *knnHeap[N, T]) pop() (knnEntry[N, T], bool) {
+	nodes := *h
+	if len(nodes) == 0 {
+		return knnEntry[N, T]{}, false
+	}
+	var n knnEntry[N, T]
+	n, nodes[0] = nodes[0], nodes[len(nodes)-1]
+	nodes = nodes[:len(nodes)-1]
+	*h = nodes
+	i := 0
+	for {
+		smallest := i
+		left := i*2 + 1
+		right := i*2 + 2
+		if left < len(nodes) && !knnLess(&nodes[smallest], &nodes[left]) {
+			smallest = left
+		}
+		if right < len(nodes) && !knnLess(&nodes[smallest], &nodes[right]) {
+			smallest = right
+		}
+		if smallest == i {
+			break
+		}
+		nodes[smallest], nodes[i] = nodes[i], nodes[smallest]
+		i = smallest
+	}
+	return n, true
+}
+
+// KNN performs a read-only k-nearest-neighbor query for the 2D point
+// `point` and returns up to k items with the smallest true Euclidean
+// distance to the point.
+//
+// The search is best-first: node rectangles are queued by their Euclidean
+// distance lower bound to the query point and nodes whose lower bound is
+// greater than the distance of the current k-th result are pruned (never
+// expanded). Items are selected and ordered by their true distance to the
+// query point; the box-distance lower bounds are only used for pruning and
+// are never reported as item distances. Items with equal distances are
+// ordered by their stable insertion ID.
+//
+// Entries (nodes or items) whose distance resolves to NaN are rejected
+// from the results. If the query point itself has a NaN or infinite
+// coordinate, ErrInvalidQueryPoint is returned. The query never modifies
+// the tree.
+func (tr *RTreeGN[N, T]) KNN(k int, point [2]N) ([]KNNItem[T], error) {
+	px, py := float64(point[0]), float64(point[1])
+	if math.IsNaN(px) || math.IsNaN(py) ||
+		math.IsInf(px, 0) || math.IsInf(py, 0) {
+		return nil, ErrInvalidQueryPoint
+	}
+	items, _ := tr.knn(k, px, py)
+	return items, nil
+}
+
+// knn is the implementation of KNN. It also returns the number of tree
+// nodes that were expanded (visited) during the search, which is useful
+// for verifying that far-away nodes are pruned.
+func (tr *RTreeGN[N, T]) knn(k int, px, py float64) ([]KNNItem[T], int) {
+	if k <= 0 || tr.root == nil {
+		return nil, 0
+	}
+	var h knnHeap[N, T]
+	var seq uint64
+	var visited int
+	key := pointRectDist2(px, py, &tr.rect)
+	if math.IsNaN(key) {
+		return nil, 0
+	}
+	h.push(knnEntry[N, T]{key: key, seq: seq, rect: tr.rect, node: tr.root})
+	seq++
+	var results []KNNItem[T]
+	cutoff := math.Inf(1) // squared distance of the k-th result
+	for {
+		e, ok := h.pop()
+		if !ok || e.key > cutoff {
+			// The queue is empty, or every queued node/item is farther
+			// away than the k-th result: the rest is pruned.
+			break
+		}
+		if e.node == nil {
+			// An item: its key is its true squared distance.
+			dist := math.Sqrt(e.key)
+			if math.IsNaN(dist) {
+				continue // reject invalid distance
+			}
+			results = append(results, KNNItem[T]{
+				Min:  [2]float64{float64(e.rect.min[0]), float64(e.rect.min[1])},
+				Max:  [2]float64{float64(e.rect.max[0]), float64(e.rect.max[1])},
+				Data: e.data,
+				Dist: dist,
+				ID:   e.id,
+			})
+			if len(results) == k {
+				cutoff = e.key
+			}
+			continue
+		}
+		// A node: expand its children.
+		visited++
+		n := e.node
+		rects := n.rects[:n.count]
+		if n.leaf() {
+			items := n.items()[:n.count]
+			ids := n.ids()[:n.count]
+			for i := 0; i < len(items); i++ {
+				key := pointRectDist2(px, py, &rects[i])
+				if math.IsNaN(key) {
+					continue // reject invalid distance
+				}
+				h.push(knnEntry[N, T]{
+					key: key, seq: seq, id: ids[i],
+					rect: rects[i], data: items[i],
+				})
+				seq++
+			}
+		} else {
+			children := n.children()[:n.count]
+			for i := 0; i < len(children); i++ {
+				key := pointRectDist2(px, py, &rects[i])
+				if math.IsNaN(key) {
+					continue // reject invalid distance
+				}
+				h.push(knnEntry[N, T]{
+					key: key, seq: seq,
+					rect: rects[i], node: children[i],
+				})
+				seq++
+			}
+		}
+	}
+	// Order by true distance, breaking ties by stable ID, and keep the
+	// first k. Items tied at the cutoff distance were all collected above,
+	// so the tie-break decides which of them make the cut.
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Dist != results[j].Dist {
+			return results[i].Dist < results[j].Dist
+		}
+		return results[i].ID < results[j].ID
+	})
+	if len(results) > k {
+		results = results[:k]
+	}
+	return results, visited
+}
+
 // BoxDist performs simple box-distance algorithm on rectangles.
 // This is the default algorithm for Nearby.
 func BoxDist[N numeric, T any](targetMin, targetMax [2]N,
@@ -1053,6 +1296,14 @@ func (tr *RTreeG[T]) Nearby(
 	tr.base.Nearby(dist, iter)
 }
 
+// KNN performs a read-only k-nearest-neighbor query for the 2D point
+// `point` and returns up to k items with the smallest true Euclidean
+// distance to the point. Items with equal distances are ordered by their
+// stable insertion ID. See RTreeGN.KNN for details.
+func (tr *RTreeG[T]) KNN(k int, point [2]float64) ([]KNNItem[T], error) {
+	return tr.base.KNN(k, point)
+}
+
 // Clear will delete all items.
 func (tr *RTreeG[T]) Clear() {
 	tr.base.Clear()
@@ -1149,6 +1400,14 @@ func (tr *RTree) Nearby(
 	iter func(min, max [2]float64, data any, dist float64) bool,
 ) {
 	tr.base.Nearby(algo, iter)
+}
+
+// KNN performs a read-only k-nearest-neighbor query for the 2D point
+// `point` and returns up to k items with the smallest true Euclidean
+// distance to the point. Items with equal distances are ordered by their
+// stable insertion ID. See RTreeGN.KNN for details.
+func (tr *RTree) KNN(k int, point [2]float64) ([]KNNItem[any], error) {
+	return tr.base.KNN(k, point)
 }
 
 // Copy the tree.
