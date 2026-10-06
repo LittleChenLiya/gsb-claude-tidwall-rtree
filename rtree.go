@@ -715,6 +715,54 @@ func (tr *RTreeGN[N, T]) Replace(
 	}
 }
 
+// MoveByID moves the item identified by a stable ID from its old box to a
+// new box. The idOf function extracts the stable ID from an item.
+//
+// The new box is validated first; when it is invalid (min > max on any
+// axis) the move is rejected and the old item is left untouched.
+// The deletion of the old entry and the insertion of the new entry are
+// treated as a single operation: the new entry is only inserted when the
+// old entry was actually found and removed. Items that share the same box
+// but carry a different ID are never removed. Returns true when the item
+// was moved.
+func (tr *RTreeGN[N, T]) MoveByID(
+	oldMin, oldMax [2]N,
+	newMin, newMax [2]N,
+	id any, idOf func(T) any,
+) bool {
+	// Validate the new box before touching the tree.
+	if !validBox(newMin, newMax) {
+		return false
+	}
+	// Find the item carrying the stable ID within the old box.
+	var data T
+	var found bool
+	tr.Search(oldMin, oldMax, func(min, max [2]N, item T) bool {
+		if idOf(item) == id {
+			data = item
+			found = true
+			return false
+		}
+		return true
+	})
+	if !found {
+		return false
+	}
+	// Delete only the entry with the matching ID, then insert it at its
+	// new box. Entries with the same box but a different ID are preserved.
+	if !tr.delete(oldMin, oldMax, data,
+		func(item, _ T) bool { return idOf(item) == id }) {
+		return false
+	}
+	tr.Insert(newMin, newMax, data)
+	return true
+}
+
+// validBox returns true when min <= max on both axes.
+func validBox[N numeric](min, max [2]N) bool {
+	return !(min[0] > max[0] || min[1] > max[1])
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeGN[N, T]) Bounds() (min, max [2]N) {
 	return tr.rect.min, tr.rect.max
@@ -988,6 +1036,16 @@ func (tr *RTreeG[T]) Replace(
 	)
 }
 
+// MoveByID moves the item identified by a stable ID from its old box to a
+// new box. See RTreeGN.MoveByID for details.
+func (tr *RTreeG[T]) MoveByID(
+	oldMin, oldMax [2]float64,
+	newMin, newMax [2]float64,
+	id any, idOf func(T) any,
+) bool {
+	return tr.base.MoveByID(oldMin, oldMax, newMin, newMax, id, idOf)
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeG[T]) Bounds() (min, max [2]float64) {
 	return tr.base.Bounds()
@@ -1094,6 +1152,16 @@ func (tr *RTree) Replace(
 		oldMin, oldMax, oldData,
 		newMin, newMax, newData,
 	)
+}
+
+// MoveByID moves the item identified by a stable ID from its old box to a
+// new box. See RTreeGN.MoveByID for details.
+func (tr *RTree) MoveByID(
+	oldMin, oldMax [2]float64,
+	newMin, newMax [2]float64,
+	id any, idOf func(any) any,
+) bool {
+	return tr.base.MoveByID(oldMin, oldMax, newMin, newMax, id, idOf)
 }
 
 // Search the structure for items that intersects the rect param
