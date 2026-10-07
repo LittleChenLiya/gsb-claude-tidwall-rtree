@@ -88,6 +88,25 @@ tr.Search([2]float32{-112.1, 33.4}, [2]float32{-112.0, 33.5},
 tr.Delete([2]float32{-112.0078, 33.4373}, [2]float32{-112.0078, 33.4373}, "PHX")
 ```
 
+### Query snapshots
+
+`SearchSnapshot` returns the items that intersect a rectangle as a slice of
+independent entries. Each entry contains a value copy of the item's current
+bounds plus the original `data` value (data is not deep copied). Mutating the
+returned bounds cannot corrupt the tree index, zero-area rectangles (points
+and line segments) follow the same intersection rule as `Search`, and later
+inserts or deletes never alter an already returned snapshot.
+
+```go
+var tr rtree.RTreeG[string]
+tr.Insert([2]float64{0, 0}, [2]float64{2, 2}, "A")
+tr.Insert([2]float64{1, 1}, [2]float64{1, 1}, "P") // zero-area point
+
+items := tr.SearchSnapshot([2]float64{0, 0}, [2]float64{5, 5})
+for i := range items {
+    items[i].Min[0] = 100 // safe: only the caller-owned copy changes
+}
+```
 
 ## Algorithms
 
