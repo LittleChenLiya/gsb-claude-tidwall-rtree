@@ -949,3 +949,215 @@ func TestNearby(t *testing.T) {
 	})
 
 }
+
+func TestReentryProtection(t *testing.T) {
+	newTree := func() *RTreeG[int] {
+		var tr RTreeG[int]
+		for i := 0; i < 100; i++ {
+			x := float64(i)
+			tr.Insert([2]float64{x, x}, [2]float64{x, x}, i)
+		}
+		return &tr
+	}
+	min := [2]float64{-1000, -1000}
+	max := [2]float64{1000, 1000}
+
+	// Case 1: callback modifies the same tree (Insert and Delete) during a
+	// protected query. Expect ErrReentry, an unchanged tree, and the
+	// protection released afterwards so the tree can be modified again.
+	t.Run("ModifySameTree", func(t *testing.T) {
+		tr := newTree()
+		tr.SetReentryProtection(true)
+		var calls int
+		err := tr.SearchE(min, max,
+			func(amin, amax [2]float64, data int) bool {
+				calls++
+				if calls == 1 {
+					// both of these must be detected and skipped
+					tr.Insert([2]float64{5000, 5000},
+						[2]float64{5000, 5000}, 9999)
+					tr.Delete(amin, amax, data)
+				}
+				return true
+			})
+		if !errors.Is(err, ErrReentry) {
+			t.Fatalf("expected ErrReentry, got %v", err)
+		}
+		if tr.Len() != 100 {
+			t.Fatalf("tree was modified during protected query, len=%d",
+				tr.Len())
+		}
+		// protection must be released: the tree is mutable again
+		tr.Insert([2]float64{5000, 5000}, [2]float64{5000, 5000}, 9999)
+		if tr.Len() != 101 {
+			t.Fatalf("expected len 101 after query, got %d", tr.Len())
+		}
+		tr.Delete([2]float64{5000, 5000}, [2]float64{5000, 5000}, 9999)
+		if tr.Len() != 100 {
+			t.Fatalf("expected len 100 after delete, got %d", tr.Len())
+		}
+	})
+
+	// Same as above but through Scan and using Delete on the same tree.
+	t.Run("DeleteSameTreeDuringScan", func(t *testing.T) {
+		tr := newTree()
+		tr.SetReentryProtection(true)
+		err := tr.ScanE(func(amin, amax [2]float64, data int) bool {
+			tr.Delete(amin, amax, data)
+			return true
+		})
+		if !errors.Is(err, ErrReentry) {
+			t.Fatalf("expected ErrReentry, got %v", err)
+		}
+		if tr.Len() != 100 {
+			t.Fatalf("tree was modified during protected scan, len=%d",
+				tr.Len())
+		}
+		// protection released
+		tr.Delete([2]float64{0, 0}, [2]float64{0, 0}, 0)
+		if tr.Len() != 99 {
+			t.Fatalf("expected len 99 after query, got %d", tr.Len())
+		}
+	})
+
+	// Reentry detection also applies to Nearby.
+	t.Run("ModifySameTreeDuringNearby", func(t *testing.T) {
+		tr := newTree()
+		tr.SetReentryProtection(true)
+		err := tr.NearbyE(
+			BoxDist[float64, int]([2]float64{0, 0}, [2]float64{0, 0}, nil),
+			func(amin, amax [2]float64, data int, dist float64) bool {
+				tr.Insert([2]float64{5000, 5000},
+					[2]float64{5000, 5000}, 9999)
+				return true
+			})
+		if !errors.Is(err, ErrReentry) {
+			t.Fatalf("expected ErrReentry, got %v", err)
+		}
+		if tr.Len() != 100 {
+			t.Fatalf("tree was modified during protected nearby, len=%d",
+				tr.Len())
+		}
+		tr.Insert([2]float64{5000, 5000}, [2]float64{5000, 5000}, 9999)
+		if tr.Len() != 101 {
+			t.Fatalf("expected len 101 after query, got %d", tr.Len())
+		}
+	})
+
+	// Case 2: callback modifies a different, independent tree. This is
+	// always allowed and must not produce an error.
+	t.Run("ModifyOtherTree", func(t *testing.T) {
+		tr := newTree()
+		other := newTree()
+		tr.SetReentryProtection(true)
+		var calls int
+		err := tr.SearchE(min, max,
+			func(amin, amax [2]float64, data int) bool {
+				calls++
+				other.Insert([2]float64{5000, 5000},
+					[2]float64{5000, 5000}, data)
+				return true
+			})
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if calls != 100 {
+			t.Fatalf("expected 100 callbacks, got %d", calls)
+		}
+		if other.Len() != 200 {
+			t.Fatalf("expected other tree len 200, got %d", other.Len())
+		}
+		if tr.Len() != 100 {
+			t.Fatalf("expected len 100, got %d", tr.Len())
+		}
+	})
+
+	// Case 3: callback stops the iteration early. No error is expected and
+	// the protection must be released so the tree is mutable afterwards.
+	t.Run("EarlyStop", func(t *testing.T) {
+		tr := newTree()
+		tr.SetReentryProtection(true)
+		var calls int
+		err := tr.ScanE(func(amin, amax [2]float64, data int) bool {
+			calls++
+			return false // stop early
+		})
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("expected 1 callback, got %d", calls)
+		}
+		// protection must be released
+		tr.Insert([2]float64{5000, 5000}, [2]float64{5000, 5000}, 9999)
+		if tr.Len() != 101 {
+			t.Fatalf("expected len 101 after early stop, got %d", tr.Len())
+		}
+		// a following query sees the new item
+		calls = 0
+		tr.Scan(func(amin, amax [2]float64, data int) bool {
+			calls++
+			return true
+		})
+		if calls != 101 {
+			t.Fatalf("expected 101 callbacks, got %d", calls)
+		}
+	})
+
+	// A panicking callback must also release the protection.
+	t.Run("CallbackPanic", func(t *testing.T) {
+		tr := newTree()
+		tr.SetReentryProtection(true)
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tr.ScanE(func(amin, amax [2]float64, data int) bool {
+				panic("boom")
+			})
+		}()
+		// protection must be released even after a panic
+		tr.Insert([2]float64{5000, 5000}, [2]float64{5000, 5000}, 9999)
+		if tr.Len() != 101 {
+			t.Fatalf("expected len 101 after panic, got %d", tr.Len())
+		}
+	})
+
+	// Default mode (protection not enabled) is unchanged: the original
+	// interfaces work as before and the error-returning variants report nil.
+	t.Run("DefaultNoProtection", func(t *testing.T) {
+		tr := newTree()
+		var count int
+		err := tr.SearchE(min, max,
+			func(amin, amax [2]float64, data int) bool {
+				count++
+				return true
+			})
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if count != 100 {
+			t.Fatalf("expected 100 callbacks, got %d", count)
+		}
+		count = 0
+		tr.Scan(func(amin, amax [2]float64, data int) bool {
+			count++
+			return true
+		})
+		if count != 100 {
+			t.Fatalf("expected 100 callbacks, got %d", count)
+		}
+		// plain Search/Scan/Nearby keep working with protection enabled too
+		tr.SetReentryProtection(true)
+		count = 0
+		tr.Search(min, max, func(amin, amax [2]float64, data int) bool {
+			count++
+			return true
+		})
+		if count != 100 {
+			t.Fatalf("expected 100 callbacks, got %d", count)
+		}
+	})
+}

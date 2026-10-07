@@ -5,12 +5,21 @@
 package rtree
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/tidwall/geoindex/child"
 )
+
+// ErrReentry is returned by the error-returning query methods (SearchE,
+// ScanE, NearbyE) when reentry protection is enabled and the query callback
+// attempts to modify (Insert/Delete/DeleteEqual/Replace/Clear) the same
+// tree that is being queried. The attempted modification is skipped and the
+// active query is aborted early. Operations on other, independent trees are
+// always allowed.
+var ErrReentry = errors.New("rtree: reentrant modification of tree during query")
 
 // SAFETY: The unsafe package is used, but with care.
 // Using "unsafe" allows for one alloction per node and avoids having to use
@@ -46,11 +55,64 @@ type numeric interface {
 }
 
 type RTreeGN[N numeric, T any] struct {
-	icow  uint64
-	count int
-	rect  rect[N]
-	root  *node[N, T]
-	qpool *sync.Pool
+	icow    uint64
+	count   int
+	rect    rect[N]
+	root    *node[N, T]
+	qpool   *sync.Pool
+	protect bool  // reentry protection enabled
+	qdepth  int   // number of active protected queries
+	qerr    error // pending reentry error for the active query
+}
+
+// SetReentryProtection enables or disables reentrancy protection for query
+// operations (Search, Scan, Nearby). When enabled, any attempt to modify the
+// tree (Insert, Delete, DeleteEqual, Replace, Clear) from within a query
+// callback is detected: the modification is skipped, the query is aborted
+// early, and ErrReentry is made available through the error-returning query
+// variants SearchE, ScanE, and NearbyE. The protection is always released
+// when the query finishes, including when the callback stops the iteration
+// early or panics. Operations on other trees are not affected.
+// Protection is disabled by default, which preserves the original behavior.
+func (tr *RTreeGN[N, T]) SetReentryProtection(enabled bool) {
+	tr.protect = enabled
+}
+
+// reentryBlocked reports whether a tree mutation is currently blocked by
+// reentry protection. When blocked, ErrReentry is recorded so that the
+// active error-returning query can report it.
+func (tr *RTreeGN[N, T]) reentryBlocked() bool {
+	if tr.protect && tr.qdepth > 0 {
+		tr.qerr = ErrReentry
+		return true
+	}
+	return false
+}
+
+// queryEnter begins a protected query section. Must be paired with
+// queryExit, typically via defer.
+func (tr *RTreeGN[N, T]) queryEnter() {
+	if tr.qdepth == 0 {
+		tr.qerr = nil
+	}
+	tr.qdepth++
+}
+
+// queryExit ends a protected query section, releasing the protection.
+func (tr *RTreeGN[N, T]) queryExit() {
+	tr.qdepth--
+}
+
+// guardIter wraps a query iterator so that the iteration stops as soon as a
+// reentry error has been recorded.
+func (tr *RTreeGN[N, T]) guardIter(iter func(min, max [2]N, data T) bool,
+) func(min, max [2]N, data T) bool {
+	return func(min, max [2]N, data T) bool {
+		if tr.qerr != nil {
+			return false
+		}
+		return iter(min, max, data)
+	}
 }
 
 type rect[N numeric] struct {
@@ -138,6 +200,11 @@ func (n *node[N, T]) rect() rect[N] {
 
 // Insert data into tree
 func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
+	if tr.reentryBlocked() {
+		// Reentry protection is enabled and a query is active on this
+		// tree. Skip the mutation; ErrReentry has been recorded.
+		return
+	}
 	ir := rect[N]{min, max}
 	if tr.root == nil {
 		if tr.qpool == nil {
@@ -448,6 +515,33 @@ func (tr *RTreeGN[N, T]) Len() int {
 func (tr *RTreeGN[N, T]) Search(min, max [2]N,
 	iter func(min, max [2]N, data T) bool,
 ) {
+	if tr.protect {
+		tr.SearchE(min, max, iter)
+		return
+	}
+	tr.search(min, max, iter)
+}
+
+// SearchE is the same as Search but returns ErrReentry when reentry
+// protection is enabled and the iter callback attempted to modify the tree
+// during the query. Returns nil when protection is disabled or no reentry
+// occurred.
+func (tr *RTreeGN[N, T]) SearchE(min, max [2]N,
+	iter func(min, max [2]N, data T) bool,
+) error {
+	if !tr.protect {
+		tr.search(min, max, iter)
+		return nil
+	}
+	tr.queryEnter()
+	defer tr.queryExit()
+	tr.search(min, max, tr.guardIter(iter))
+	return tr.qerr
+}
+
+func (tr *RTreeGN[N, T]) search(min, max [2]N,
+	iter func(min, max [2]N, data T) bool,
+) {
 	target := rect[N]{min, max}
 	if tr.root == nil {
 		return
@@ -459,6 +553,28 @@ func (tr *RTreeGN[N, T]) Search(min, max [2]N,
 
 // Scane all items in the tree
 func (tr *RTreeGN[N, T]) Scan(iter func(min, max [2]N, data T) bool) {
+	if tr.protect {
+		tr.ScanE(iter)
+		return
+	}
+	tr.scan(iter)
+}
+
+// ScanE is the same as Scan but returns ErrReentry when reentry protection
+// is enabled and the iter callback attempted to modify the tree during the
+// query. Returns nil when protection is disabled or no reentry occurred.
+func (tr *RTreeGN[N, T]) ScanE(iter func(min, max [2]N, data T) bool) error {
+	if !tr.protect {
+		tr.scan(iter)
+		return nil
+	}
+	tr.queryEnter()
+	defer tr.queryExit()
+	tr.scan(tr.guardIter(iter))
+	return tr.qerr
+}
+
+func (tr *RTreeGN[N, T]) scan(iter func(min, max [2]N, data T) bool) {
 	if tr.root != nil {
 		tr.root.scan(iter)
 	}
@@ -489,6 +605,8 @@ func (tr *RTreeGN[N, T]) Copy() *RTreeGN[N, T] {
 	*tr2 = *tr
 	tr.icow = gcow.Add(1)
 	tr2.icow = gcow.Add(1)
+	tr2.qdepth = 0
+	tr2.qerr = nil
 	return tr2
 }
 
@@ -582,6 +700,11 @@ func (tr *RTreeGN[N, T]) DeleteEqual(min, max [2]N, keydata T,
 
 func (tr *RTreeGN[N, T]) delete(min, max [2]N, data T, eq func(T, T) bool,
 ) bool {
+	if tr.reentryBlocked() {
+		// Reentry protection is enabled and a query is active on this
+		// tree. Skip the mutation; ErrReentry has been recorded.
+		return false
+	}
 	ir := rect[N]{min, max}
 	if tr.root == nil || !tr.rect.contains(&ir) {
 		return false
@@ -794,6 +917,40 @@ func (tr *RTreeGN[N, T]) Nearby(
 	dist func(min, max [2]N, data T, item bool) N,
 	iter func(min, max [2]N, data T, dist N) bool,
 ) {
+	if tr.protect {
+		tr.NearbyE(dist, iter)
+		return
+	}
+	tr.nearby(dist, iter)
+}
+
+// NearbyE is the same as Nearby but returns ErrReentry when reentry
+// protection is enabled and the iter callback attempted to modify the tree
+// during the query. Returns nil when protection is disabled or no reentry
+// occurred.
+func (tr *RTreeGN[N, T]) NearbyE(
+	dist func(min, max [2]N, data T, item bool) N,
+	iter func(min, max [2]N, data T, dist N) bool,
+) error {
+	if !tr.protect {
+		tr.nearby(dist, iter)
+		return nil
+	}
+	tr.queryEnter()
+	defer tr.queryExit()
+	tr.nearby(dist, func(min, max [2]N, data T, d N) bool {
+		if tr.qerr != nil {
+			return false
+		}
+		return iter(min, max, data, d)
+	})
+	return tr.qerr
+}
+
+func (tr *RTreeGN[N, T]) nearby(
+	dist func(min, max [2]N, data T, item bool) N,
+	iter func(min, max [2]N, data T, dist N) bool,
+) {
 	var empty T
 	if tr.root == nil {
 		return
@@ -921,6 +1078,11 @@ func (r *rect[N]) boxDist(b *rect[N]) N {
 
 // Clear will delete all items.
 func (tr *RTreeGN[N, T]) Clear() {
+	if tr.reentryBlocked() {
+		// Reentry protection is enabled and a query is active on this
+		// tree. Skip the mutation; ErrReentry has been recorded.
+		return
+	}
 	tr.count = 0
 	tr.rect = rect[N]{}
 	tr.root = nil
@@ -954,6 +1116,39 @@ func (tr *RTreeG[T]) Search(min, max [2]float64,
 // Scan all items in the tree
 func (tr *RTreeG[T]) Scan(iter func(min, max [2]float64, data T) bool) {
 	tr.base.Scan(iter)
+}
+
+// SetReentryProtection enables or disables reentrancy protection for query
+// operations. See RTreeGN.SetReentryProtection for details.
+func (tr *RTreeG[T]) SetReentryProtection(enabled bool) {
+	tr.base.SetReentryProtection(enabled)
+}
+
+// SearchE is the same as Search but returns ErrReentry when reentry
+// protection is enabled and the iter callback attempted to modify the tree
+// during the query.
+func (tr *RTreeG[T]) SearchE(min, max [2]float64,
+	iter func(min, max [2]float64, data T) bool,
+) error {
+	return tr.base.SearchE(min, max, iter)
+}
+
+// ScanE is the same as Scan but returns ErrReentry when reentry protection
+// is enabled and the iter callback attempted to modify the tree during the
+// query.
+func (tr *RTreeG[T]) ScanE(iter func(min, max [2]float64, data T) bool,
+) error {
+	return tr.base.ScanE(iter)
+}
+
+// NearbyE is the same as Nearby but returns ErrReentry when reentry
+// protection is enabled and the iter callback attempted to modify the tree
+// during the query.
+func (tr *RTreeG[T]) NearbyE(
+	dist func(min, max [2]float64, data T, item bool) float64,
+	iter func(min, max [2]float64, data T, dist float64) bool,
+) error {
+	return tr.base.NearbyE(dist, iter)
 }
 
 // Copy the tree.
@@ -1107,6 +1302,39 @@ func (tr *RTree) Search(
 // Scan iterates through all data in tree in no specified order.
 func (tr *RTree) Scan(iter func(min, max [2]float64, data any) bool) {
 	tr.base.Scan(iter)
+}
+
+// SetReentryProtection enables or disables reentrancy protection for query
+// operations. See RTreeGN.SetReentryProtection for details.
+func (tr *RTree) SetReentryProtection(enabled bool) {
+	tr.base.SetReentryProtection(enabled)
+}
+
+// SearchE is the same as Search but returns ErrReentry when reentry
+// protection is enabled and the iter callback attempted to modify the tree
+// during the query.
+func (tr *RTree) SearchE(
+	min, max [2]float64,
+	iter func(min, max [2]float64, data any) bool,
+) error {
+	return tr.base.SearchE(min, max, iter)
+}
+
+// ScanE is the same as Scan but returns ErrReentry when reentry protection
+// is enabled and the iter callback attempted to modify the tree during the
+// query.
+func (tr *RTree) ScanE(iter func(min, max [2]float64, data any) bool) error {
+	return tr.base.ScanE(iter)
+}
+
+// NearbyE is the same as Nearby but returns ErrReentry when reentry
+// protection is enabled and the iter callback attempted to modify the tree
+// during the query.
+func (tr *RTree) NearbyE(
+	algo func(min, max [2]float64, data any, item bool) (dist float64),
+	iter func(min, max [2]float64, data any, dist float64) bool,
+) error {
+	return tr.base.NearbyE(algo, iter)
 }
 
 // Len returns the number of items in tree
