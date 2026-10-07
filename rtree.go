@@ -457,7 +457,41 @@ func (tr *RTreeGN[N, T]) Search(min, max [2]N,
 	}
 }
 
-// Scane all items in the tree
+// Item is a single snapshot entry returned from SearchSnapshot.
+//
+// Min and Max are independent copies of the item's current rectangle. They can
+// be edited freely without affecting the tree index. Data is the original
+// value stored in the tree and is intentionally not deep-copied: pointers,
+// maps, and slices keep sharing their underlying storage with the inserted
+// value.
+type Item[N numeric, T any] struct {
+	Min  [2]N
+	Max  [2]N
+	Data T
+}
+
+// SearchSnapshot returns a snapshot of the items that intersect the provided
+// rectangle. The same intersection rule as Search is used, so zero-area
+// rectangles (points) match whenever they touch a boundary.
+//
+// Each entry holds a private copy of the item's current min/max rectangle, so
+// mutating the returned rectangles cannot corrupt the tree index, and later
+// deleting or replacing items never alters a previously returned snapshot.
+// The item data is shared by reference and is not deep-copied.
+func (tr *RTreeGN[N, T]) SearchSnapshot(min, max [2]N) []Item[N, T] {
+	target := rect[N]{min, max}
+	if tr.root == nil || !target.intersects(&tr.rect) {
+		return nil
+	}
+	var items []Item[N, T]
+	tr.root.search(&target, func(min, max [2]N, data T) bool {
+		items = append(items, Item[N, T]{Min: min, Max: max, Data: data})
+		return true
+	})
+	return items
+}
+
+// Scan all items in the tree
 func (tr *RTreeGN[N, T]) Scan(iter func(min, max [2]N, data T) bool) {
 	if tr.root != nil {
 		tr.root.scan(iter)
@@ -951,6 +985,14 @@ func (tr *RTreeG[T]) Search(min, max [2]float64,
 	tr.base.Search(min, max, iter)
 }
 
+// SearchSnapshot returns a snapshot of the items that intersect the provided
+// rectangle. The returned rectangles are private copies and can be mutated
+// without corrupting the tree; the item data is not deep-copied. Later
+// deletions never change a previously returned snapshot.
+func (tr *RTreeG[T]) SearchSnapshot(min, max [2]float64) []Item[float64, T] {
+	return tr.base.SearchSnapshot(min, max)
+}
+
 // Scan all items in the tree
 func (tr *RTreeG[T]) Scan(iter func(min, max [2]float64, data T) bool) {
 	tr.base.Scan(iter)
@@ -1102,6 +1144,16 @@ func (tr *RTree) Search(
 	iter func(min, max [2]float64, data any) bool,
 ) {
 	tr.base.Search(min, max, iter)
+}
+
+// SearchSnapshot returns a snapshot of the items that intersect the provided
+// rectangle. The returned rectangles are private copies and can be mutated
+// without corrupting the tree; the item data is not deep-copied. Later
+// deletions never change a previously returned snapshot.
+func (tr *RTree) SearchSnapshot(
+	min, max [2]float64,
+) []Item[float64, any] {
+	return tr.base.SearchSnapshot(min, max)
 }
 
 // Scan iterates through all data in tree in no specified order.

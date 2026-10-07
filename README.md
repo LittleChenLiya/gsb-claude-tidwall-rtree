@@ -41,6 +41,23 @@ tr.Search([2]float64{-112.1, 33.4}, [2]float64{-112.0, 33.5},
 tr.Delete([2]float64{-112.0078, 33.4373}, [2]float64{-112.0078, 33.4373}, "PHX")
 ```
 
+### Query snapshots
+
+`SearchSnapshot` runs the same intersection query as `Search` (zero-area
+rectangles follow the usual boundary-touching rule) but returns a slice of
+`Item` entries. Each item's min/max rectangle is a private copy, so editing it
+cannot corrupt the tree index, and later deletes or replacements never change
+an already returned snapshot. The item `Data` is the original value and is not
+deep-copied.
+
+```go
+items := tr.SearchSnapshot([2]float64{0, 0}, [2]float64{15, 15})
+for i := range items {
+    items[i].Min[0] = 900 // safe: only the snapshot copy changes
+}
+tr.Delete([2]float64{0, 0}, [2]float64{10, 10}, "rect") // items stays intact
+```
+
 ### Support for Generics (Go 1.18+)
 
 ```go
